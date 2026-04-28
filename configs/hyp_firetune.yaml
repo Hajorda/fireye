@@ -1,0 +1,31 @@
+# FireEye custom hyperparameters for YOLOv8m wildfire fine-tuning
+# Passed via: model.train(cfg="configs/hyp_firetune.yaml", ...)
+
+# Learning rate schedule
+lr0: 0.001          # lower than YOLO default (0.01) — we're fine-tuning from COCO
+lrf: 0.01           # final LR = lr0 * lrf (cosine decay target)
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 3.0
+warmup_momentum: 0.8
+warmup_bias_lr: 0.1
+
+# Loss weights
+box: 7.5
+cls: 0.5
+dfl: 1.5
+
+# Online augmentation (complements offline Albumentations pass)
+hsv_h: 0.015        # hue shift
+hsv_s: 0.7          # saturation shift
+hsv_v: 0.4          # value/brightness shift
+degrees: 5.0        # small rotation only — CCTV cameras are mostly fixed
+translate: 0.1
+scale: 0.5
+shear: 0.0
+perspective: 0.0001
+flipud: 0.0         # NEVER flip vertically — sky/ground orientation is semantic
+fliplr: 0.5
+mosaic: 1.0         # keep at 1.0 — critical for detecting small smoke at range
+mixup: 0.1
+copy_paste: 0.1     # paste extra fire instances onto non-fire backgrounds

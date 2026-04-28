@@ -1,0 +1,12 @@
+# FireEye wildfire detection dataset config
+# The 'path' field is patched at runtime in Colab — see 02_train_yolov8m.ipynb
+path: /content/drive/MyDrive/fireye/data/merged
+
+train: images/train
+val:   images/val
+test:  images/test
+
+nc: 2
+names:
+  0: fire
+  1: smoke

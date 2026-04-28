@@ -1,0 +1,190 @@
+"""
+Merge all processed sources into a single YOLO dataset with train/val/test splits.
+
+Steps:
+  1. Collect all image paths from data/processed/*/images/
+  2. Deduplicate via perceptual hash (pHash, threshold=8)
+  3. Shuffle with seed=42
+  4. Stratified split: 70% train / 20% val / 10% test (stratified by source)
+  5. Copy images + labels into data/merged/{images,labels}/{train,val,test}/
+  6. Write data/merged/dataset.yaml
+
+Run from repo root:
+    python scripts/merge_datasets.py --processed-root data/processed --merged-root data/merged
+"""
+
+import argparse
+import random
+import shutil
+from collections import defaultdict
+from pathlib import Path
+
+import imagehash
+from PIL import Image
+from tqdm import tqdm
+
+
+SPLIT_RATIOS = {"train": 0.70, "val": 0.20, "test": 0.10}
+PHASH_THRESHOLD = 8  # Hamming distance; images with dist <= threshold are near-dupes
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
+
+
+def collect_images(processed_root: Path) -> dict[str, list[Path]]:
+    """Return {source_name: [image_path, ...]} for all processed sources."""
+    sources: dict[str, list[Path]] = {}
+    for source_dir in sorted(processed_root.iterdir()):
+        if not source_dir.is_dir():
+            continue
+        images_dir = source_dir / "images"
+        if not images_dir.exists():
+            continue
+        paths = [p for p in images_dir.rglob("*") if p.suffix.lower() in IMAGE_EXTS]
+        sources[source_dir.name] = paths
+        print(f"  {source_dir.name}: {len(paths)} images")
+    return sources
+
+
+def deduplicate(
+    source_images: dict[str, list[Path]],
+    threshold: int = PHASH_THRESHOLD,
+) -> dict[str, list[Path]]:
+    """
+    Remove near-duplicate images across all sources using perceptual hashing.
+    Keeps the first occurrence (priority order: dfire > catargiu > pyro_sdis > aiformankind).
+    """
+    seen_hashes: list[tuple[imagehash.ImageHash, str]] = []
+    deduped: dict[str, list[Path]] = defaultdict(list)
+    removed = 0
+
+    priority_order = ["dfire", "catargiu", "pyro_sdis", "aiformankind"]
+    ordered_sources = sorted(
+        source_images.keys(),
+        key=lambda s: priority_order.index(s) if s in priority_order else 999,
+    )
+
+    for source in ordered_sources:
+        for img_path in tqdm(source_images[source], desc=f"  Hashing {source}"):
+            try:
+                h = imagehash.phash(Image.open(img_path))
+            except Exception:
+                continue
+
+            is_dup = any(abs(h - sh) <= threshold for sh, _ in seen_hashes)
+            if is_dup:
+                removed += 1
+            else:
+                seen_hashes.append((h, source))
+                deduped[source].append(img_path)
+
+    print(f"  Deduplication: removed {removed} near-duplicate images")
+    return dict(deduped)
+
+
+def stratified_split(
+    source_images: dict[str, list[Path]],
+    ratios: dict[str, float] = SPLIT_RATIOS,
+    seed: int = 42,
+) -> dict[str, list[tuple[str, Path]]]:
+    """
+    Return {"train": [(source, img_path), ...], "val": [...], "test": [...]}.
+    Stratified by source so each split has proportional source representation.
+    """
+    random.seed(seed)
+    splits: dict[str, list[tuple[str, Path]]] = {"train": [], "val": [], "test": []}
+
+    for source, images in source_images.items():
+        shuffled = list(images)
+        random.shuffle(shuffled)
+        n = len(shuffled)
+        n_train = int(n * ratios["train"])
+        n_val = int(n * ratios["val"])
+
+        splits["train"].extend((source, p) for p in shuffled[:n_train])
+        splits["val"].extend((source, p) for p in shuffled[n_train : n_train + n_val])
+        splits["test"].extend((source, p) for p in shuffled[n_train + n_val :])
+
+    for split_name, items in splits.items():
+        random.shuffle(items)  # shuffle within each split too
+        print(f"  {split_name}: {len(items)} images")
+
+    return splits
+
+
+def copy_split(
+    split_name: str,
+    items: list[tuple[str, Path]],
+    processed_root: Path,
+    merged_root: Path,
+) -> None:
+    img_out = merged_root / "images" / split_name
+    lbl_out = merged_root / "labels" / split_name
+    img_out.mkdir(parents=True, exist_ok=True)
+    lbl_out.mkdir(parents=True, exist_ok=True)
+
+    for source, img_path in tqdm(items, desc=f"  Copying {split_name}"):
+        # Unique filename: {source}_{original_stem}{ext}
+        new_stem = f"{source}_{img_path.stem}"
+        dst_img = img_out / f"{new_stem}{img_path.suffix.lower()}"
+        shutil.copy2(img_path, dst_img)
+
+        # Paired label
+        lbl_src = processed_root / source / "labels" / f"{img_path.stem}.txt"
+        dst_lbl = lbl_out / f"{new_stem}.txt"
+        if lbl_src.exists():
+            shutil.copy2(lbl_src, dst_lbl)
+        else:
+            dst_lbl.write_text("")  # hard negative
+
+
+def write_dataset_yaml(merged_root: Path) -> None:
+    yaml_content = f"""# FireEye wildfire detection — auto-generated by merge_datasets.py
+# The 'path' field is patched at runtime in Colab
+path: {merged_root.resolve()}
+
+train: images/train
+val:   images/val
+test:  images/test
+
+nc: 2
+names:
+  0: fire
+  1: smoke
+"""
+    (merged_root / "dataset.yaml").write_text(yaml_content)
+    print(f"  Wrote {merged_root / 'dataset.yaml'}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Merge processed datasets")
+    parser.add_argument("--processed-root", default="data/processed")
+    parser.add_argument("--merged-root", default="data/merged")
+    parser.add_argument("--no-dedup", action="store_true", help="Skip deduplication (faster)")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    processed_root = Path(args.processed_root)
+    merged_root = Path(args.merged_root)
+
+    print("Collecting images...")
+    source_images = collect_images(processed_root)
+
+    if not args.no_dedup:
+        print("\nDeduplicating...")
+        source_images = deduplicate(source_images)
+
+    print("\nSplitting...")
+    splits = stratified_split(source_images, seed=args.seed)
+
+    print("\nCopying files...")
+    for split_name, items in splits.items():
+        copy_split(split_name, items, processed_root, merged_root)
+
+    print("\nWriting dataset.yaml...")
+    write_dataset_yaml(merged_root)
+
+    total = sum(len(v) for v in splits.values())
+    print(f"\nMerge complete — {total} total images in {merged_root}")
+
+
+if __name__ == "__main__":
+    main()
